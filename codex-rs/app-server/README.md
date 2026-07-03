@@ -440,6 +440,7 @@ Enable `capabilities.experimentalApi` during initialization, then use `thread/li
 - Includes `threadId` and the new `status`.
 - Status can be `notLoaded`, `idle`, `systemError`, or `active` (with `activeFlags`; `active` implies running).
 - `thread/start`, `thread/fork`, and detached review threads do not emit a separate initial `thread/status/changed`; their `thread/started` notification already carries the current `thread.status`.
+- During `initialize`, the server also replays currently `active` loaded threads to the newly initialized connection so reconnecting clients can restore running-state UI immediately.
 
 ```json
 {
