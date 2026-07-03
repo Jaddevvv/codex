@@ -727,6 +727,9 @@ impl MessageProcessor {
         self.initialize_processor
             .send_initialize_notifications_to_connection(connection_id)
             .await;
+        self.thread_processor
+            .send_active_thread_status_notifications_to_connection(connection_id)
+            .await;
     }
 
     pub(crate) async fn connection_initialized(
@@ -747,6 +750,9 @@ impl MessageProcessor {
     pub(crate) async fn send_initialize_notifications(&self) {
         self.initialize_processor
             .send_initialize_notifications()
+            .await;
+        self.thread_processor
+            .send_active_thread_status_notifications()
             .await;
     }
 
