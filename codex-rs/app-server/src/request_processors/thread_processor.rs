@@ -1,6 +1,7 @@
 use super::*;
 use crate::error_code::method_not_found;
 use codex_app_server_protocol::SelectedCapabilityRoot;
+use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
@@ -2543,6 +2544,63 @@ impl ThreadRequestProcessor {
 
     pub(crate) fn thread_created_receiver(&self) -> broadcast::Receiver<ThreadId> {
         self.thread_manager.subscribe_thread_created()
+    }
+
+    pub(crate) async fn send_active_thread_status_notifications_to_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) {
+        self.send_active_thread_status_notifications_inner(Some(&[connection_id]))
+            .await;
+    }
+
+    pub(crate) async fn send_active_thread_status_notifications(&self) {
+        self.send_active_thread_status_notifications_inner(None)
+            .await;
+    }
+
+    async fn send_active_thread_status_notifications_inner(
+        &self,
+        connection_ids: Option<&[ConnectionId]>,
+    ) {
+        let mut thread_ids = self
+            .thread_manager
+            .list_thread_ids()
+            .await
+            .into_iter()
+            .map(|thread_id| thread_id.to_string())
+            .collect::<Vec<_>>();
+        thread_ids.sort();
+
+        let statuses = self
+            .thread_watch_manager
+            .loaded_statuses_for_threads(thread_ids.clone())
+            .await;
+
+        // Re-emit active thread status on initialize so reconnecting clients
+        // can rebuild running-thread UI without waiting for another transition.
+        for thread_id in thread_ids {
+            let Some(ThreadStatus::Active { active_flags }) = statuses.get(&thread_id) else {
+                continue;
+            };
+            let notification =
+                ServerNotification::ThreadStatusChanged(ThreadStatusChangedNotification {
+                    thread_id,
+                    status: ThreadStatus::Active {
+                        active_flags: active_flags.clone(),
+                    },
+                });
+            match connection_ids {
+                Some(connection_ids) => {
+                    self.outgoing
+                        .send_server_notification_to_connections(connection_ids, notification)
+                        .await;
+                }
+                None => {
+                    self.outgoing.send_server_notification(notification).await;
+                }
+            }
+        }
     }
 
     pub(crate) async fn connection_initialized(
