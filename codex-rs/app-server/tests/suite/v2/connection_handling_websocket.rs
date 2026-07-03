@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::DISABLE_PLUGIN_STARTUP_TASKS_ARG;
+use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
 use base64::Engine;
@@ -18,6 +19,11 @@ use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadStatusChangedNotification;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::UserInput as V2UserInput;
+use core_test_support::responses;
 use futures::SinkExt;
 use futures::StreamExt;
 use hmac::Hmac;
@@ -25,6 +31,7 @@ use hmac::Mac;
 use reqwest::StatusCode;
 use serde_json::json;
 use sha2::Sha256;
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Stdio;
@@ -375,6 +382,169 @@ async fn websocket_disconnect_keeps_last_subscribed_thread_loaded_until_idle_tim
     Ok(())
 }
 
+#[tokio::test]
+async fn websocket_initialize_replays_active_thread_status_for_reconnecting_clients() -> Result<()>
+{
+    let server = responses::start_mock_server().await;
+    let _response_mock = responses::mount_response_once(
+        &server,
+        responses::sse_response(create_final_assistant_message_sse_response("Done")?)
+            .set_delay(Duration::from_secs(30)),
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+
+    let mut ws1 = connect_websocket(bind_addr).await?;
+    send_initialize_request(&mut ws1, /*id*/ 1, "ws_thread_owner").await?;
+    read_response_for_id(&mut ws1, /*id*/ 1).await?;
+
+    let thread_id = start_thread(&mut ws1, /*id*/ 2).await?;
+    send_turn_start_request(&mut ws1, /*id*/ 3, &thread_id).await?;
+    let (_turn_start_response, status_notification) =
+        read_response_and_notification_for_method(&mut ws1, /*id*/ 3, "thread/status/changed")
+            .await?;
+    let status_notification: ThreadStatusChangedNotification = serde_json::from_value(
+        status_notification
+            .params
+            .context("missing notification params")?,
+    )?;
+    assert_eq!(status_notification.thread_id, thread_id);
+    assert!(matches!(
+        status_notification.status,
+        ThreadStatus::Active { .. }
+    ));
+
+    ws1.close(None).await.context("failed to close websocket")?;
+    drop(ws1);
+
+    let mut ws2 = connect_websocket(bind_addr).await?;
+    send_initialize_request(&mut ws2, /*id*/ 4, "ws_reconnect_client").await?;
+    read_response_for_id(&mut ws2, /*id*/ 4).await?;
+
+    let replayed_status_notification =
+        read_notification_for_method(&mut ws2, "thread/status/changed").await?;
+    let replayed_status_notification: ThreadStatusChangedNotification = serde_json::from_value(
+        replayed_status_notification
+            .params
+            .context("missing replayed notification params")?,
+    )?;
+    assert_eq!(replayed_status_notification.thread_id, thread_id);
+    assert!(matches!(
+        replayed_status_notification.status,
+        ThreadStatus::Active { .. }
+    ));
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_initialize_replays_all_active_thread_statuses_for_reconnecting_clients()
+-> Result<()> {
+    let server = responses::start_mock_server().await;
+    let first_response =
+        responses::sse_response(create_final_assistant_message_sse_response("Done")?)
+            .set_delay(Duration::from_secs(30));
+    let second_response =
+        responses::sse_response(create_final_assistant_message_sse_response("Done")?)
+            .set_delay(Duration::from_secs(30));
+    let response_mock =
+        responses::mount_response_sequence(&server, vec![first_response, second_response]).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+
+    let mut ws1 = connect_websocket(bind_addr).await?;
+    send_initialize_request(&mut ws1, /*id*/ 1, "ws_thread_owner").await?;
+    read_response_for_id(&mut ws1, /*id*/ 1).await?;
+
+    let first_thread_id = start_thread(&mut ws1, /*id*/ 2).await?;
+    send_turn_start_request(&mut ws1, /*id*/ 3, &first_thread_id).await?;
+    let (_turn_start_response, first_status_notification) =
+        read_response_and_notification_for_method(&mut ws1, /*id*/ 3, "thread/status/changed")
+            .await?;
+    let first_status_notification: ThreadStatusChangedNotification = serde_json::from_value(
+        first_status_notification
+            .params
+            .context("missing first notification params")?,
+    )?;
+    assert_eq!(first_status_notification.thread_id, first_thread_id);
+    assert!(matches!(
+        first_status_notification.status,
+        ThreadStatus::Active { .. }
+    ));
+
+    let second_thread_id = start_thread(&mut ws1, /*id*/ 4).await?;
+    send_turn_start_request(&mut ws1, /*id*/ 5, &second_thread_id).await?;
+    let (_turn_start_response, second_status_notification) =
+        read_response_and_notification_for_method(&mut ws1, /*id*/ 5, "thread/status/changed")
+            .await?;
+    let second_status_notification: ThreadStatusChangedNotification = serde_json::from_value(
+        second_status_notification
+            .params
+            .context("missing second notification params")?,
+    )?;
+    assert_eq!(second_status_notification.thread_id, second_thread_id);
+    assert!(matches!(
+        second_status_notification.status,
+        ThreadStatus::Active { .. }
+    ));
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            if response_mock.requests().len() >= 2 {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for two delayed model requests")?;
+
+    ws1.close(None).await.context("failed to close websocket")?;
+    drop(ws1);
+
+    let mut ws2 = connect_websocket(bind_addr).await?;
+    send_initialize_request(&mut ws2, /*id*/ 6, "ws_reconnect_client").await?;
+    read_response_for_id(&mut ws2, /*id*/ 6).await?;
+
+    let expected_thread_ids = BTreeSet::from([first_thread_id.clone(), second_thread_id.clone()]);
+    let replayed_thread_ids = timeout(DEFAULT_READ_TIMEOUT, async {
+        let mut replayed_thread_ids = BTreeSet::new();
+        while replayed_thread_ids.len() < expected_thread_ids.len() {
+            let replayed_status_notification =
+                read_notification_for_method(&mut ws2, "thread/status/changed").await?;
+            let replayed_status_notification: ThreadStatusChangedNotification =
+                serde_json::from_value(
+                    replayed_status_notification
+                        .params
+                        .context("missing replayed notification params")?,
+                )?;
+            assert!(matches!(
+                replayed_status_notification.status,
+                ThreadStatus::Active { .. }
+            ));
+            replayed_thread_ids.insert(replayed_status_notification.thread_id);
+        }
+        Ok::<BTreeSet<String>, anyhow::Error>(replayed_thread_ids)
+    })
+    .await
+    .context("timed out waiting for replayed active thread statuses")??;
+    assert_eq!(replayed_thread_ids, expected_thread_ids);
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
 pub(super) async fn spawn_websocket_server(codex_home: &Path) -> Result<(Child, SocketAddr)> {
     spawn_websocket_server_with_args(codex_home, "ws://127.0.0.1:0", &[]).await
 }
@@ -623,6 +793,24 @@ async fn start_thread(stream: &mut WsClient, id: i64) -> Result<String> {
     let response = read_response_for_id(stream, id).await?;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(response)?;
     Ok(thread.id)
+}
+
+async fn send_turn_start_request(stream: &mut WsClient, id: i64, thread_id: &str) -> Result<()> {
+    send_request(
+        stream,
+        "turn/start",
+        id,
+        Some(serde_json::to_value(TurnStartParams {
+            thread_id: thread_id.to_string(),
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: "Hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })?),
+    )
+    .await
 }
 
 async fn assert_loaded_threads(stream: &mut WsClient, id: i64, expected: &[&str]) -> Result<()> {
